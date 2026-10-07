@@ -1946,6 +1946,32 @@ const READ_BUF: usize = 16 * 1024;
 const MAX_PENDING: usize = 4 * 1024 * 1024;
 const OVERFLOW_NOTICE: &[u8] = b"\x1bc\x1b[2m[xshell: dropped output due to backpressure]\x1b[0m\r\n";
 
+// Codex keeps its shared app-server daemon's PID in ~/.codex/app-server-daemon/daemon.pid and
+// trusts it on the next launch. Once the daemon has exited, Windows can hand that PID to an
+// unrelated (often protected) process, and `codex resume` then fails with "failed to open
+// daemon process: Access is denied (os error 5)". Before spawning Codex, move PID files whose
+// process is gone or isn't Codex aside, so Codex starts a fresh daemon.
+#[cfg(windows)]
+fn clear_stale_codex_daemon_pids() {
+    use std::os::windows::process::CommandExt;
+    let Some(dir) = dirs::home_dir().map(|h| h.join(".codex").join("app-server-daemon")) else { return };
+    for name in ["daemon.pid", "daemon-updater.pid"] {
+        let path = dir.join(name);
+        let Ok(content) = fs::read_to_string(&path) else { continue };
+        let Some(pid) = serde_json::from_str::<serde_json::Value>(&content).ok().and_then(|j| j.get("pid").and_then(|v| v.as_u64())) else { continue };
+        let Ok(out) = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output() else { continue };
+        // Matching row: "image.exe","<pid>",... ; no match prints an INFO line instead.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let image = stdout.lines().find(|l| l.starts_with('"')).and_then(|l| l.split(',').next()).map(|f| f.trim_matches('"').to_ascii_lowercase());
+        if image.map_or(true, |img| !img.starts_with("codex")) {
+            let _ = fs::rename(&path, path.with_extension("pid.stale"));
+        }
+    }
+}
+
 #[tauri::command]
 fn spawn_terminal(state: State<'_, AppState>, id: String, session_id: Option<String>, cwd: String, cols: u16, rows: u16, shell_mode: Option<String>, shell_command: Option<String>, shell_id: Option<String>, agent: Option<String>, fullscreen_rendering: Option<bool>, force_sync_output: Option<bool>, on_data: Channel<Response>, on_exit: Channel<i32>) -> Result<(), String> {
     let pty_system = native_pty_system();
@@ -1961,6 +1987,8 @@ fn spawn_terminal(state: State<'_, AppState>, id: String, session_id: Option<Str
         Some("antigravity") => "agy",
         _ => "claude",
     };
+    #[cfg(windows)]
+    if agent_bin == "codex" { clear_stale_codex_daemon_pids(); }
     // Resume args per agent:
     //  - Claude: new chats arrive with a pre-allocated UUID and no JSONL on disk → use
     //    `--session-id` so Claude creates the session under our UUID (leaving customTitle
