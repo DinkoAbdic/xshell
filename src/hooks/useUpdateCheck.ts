@@ -30,6 +30,11 @@ export interface UpdateInfo {
 // fetch the GitHub Releases list, but only to populate the multi-release changelog in
 // Settings → About. That secondary call is best-effort: a failure there doesn't block the
 // badge or the install button.
+// Personal fork: update checks are off. The endpoint in tauri.conf.json serves the upstream
+// MertPROJ/xshell releases, and installing one would replace this fork's build. The changelog
+// below still lists upstream releases for reference.
+const UPDATE_CHECK_ENABLED = false;
+
 export function useUpdateCheck(): UpdateInfo {
   const [currentVersion, setCurrentVersion] = useState("");
   const [update, setUpdate] = useState<Update | null>(null);
@@ -47,7 +52,7 @@ export function useUpdateCheck(): UpdateInfo {
         const cv = await getVersion();
         if (cancelled) return;
         setCurrentVersion(cv);
-        const u = await check();
+        const u = UPDATE_CHECK_ENABLED ? await check() : null;
         if (cancelled) return;
         setUpdate(u);
       } catch (e: any) {

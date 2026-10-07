@@ -127,7 +127,9 @@ export default function App() {
   // Sets CLAUDE_CODE_NO_FLICKER=1 on every claude session so it uses the alternate-screen
   // buffer renderer. Default ON — flicker-free is what most users want; only flip if the
   // user wants scrollback-style output (or hits a renderer bug).
-  const [fullscreenRendering, setFullscreenRendering] = useState(true);
+  // Off by default: the alternate-screen renderer keeps no scrollback, so the terminal
+  // scrollbar would always be empty in Claude tabs.
+  const [fullscreenRendering, setFullscreenRendering] = useState(false);
   // Sets CLAUDE_CODE_FORCE_SYNC_OUTPUT=1 so claude wraps each TUI frame in DEC 2026
   // synchronized-output markers. xterm.js v5+ honors them and renders only complete
   // frames — fixes the "flying letters" residue where xterm would otherwise see

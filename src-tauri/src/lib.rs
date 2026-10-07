@@ -2312,9 +2312,10 @@ fn spawn_terminal(state: State<'_, AppState>, id: String, session_id: Option<Str
     // Unknown bucket). Always set — no user-facing toggle.
     cmd.env("TERM_PROGRAM", "xshell.sh");
     // Claude Code's flicker-free / alternate-screen-buffer renderer is opt-in via env var.
-    // Default ON for any claude-mode spawn; raw shells don't get it (no claude process to read it).
+    // Default OFF (it disables scrollback, so the terminal scrollbar would be empty); raw
+    // shells never get it (no claude process to read it).
     // Inherited by the wrapping shell → claude child, so setting it here is sufficient.
-    if mode != "raw" && agent_bin == "claude" && fullscreen_rendering.unwrap_or(true) {
+    if mode != "raw" && agent_bin == "claude" && fullscreen_rendering.unwrap_or(false) {
         cmd.env("CLAUDE_CODE_NO_FLICKER", "1");
     }
     // Force synchronized output mode (DEC 2026). Claude's auto-detection looks at $TERM
