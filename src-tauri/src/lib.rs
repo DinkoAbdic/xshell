@@ -147,6 +147,31 @@ fn stats_path_for(session_id: &str) -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".claude").join("xshell-stats").join(format!("{}.json", session_id)))
 }
 
+// Title text for a user prompt. Slash commands are recorded as
+// `<command-name>/goal</command-name><command-message>…</command-message><command-args>…</command-args>`
+// (tag order varies) — shown as "/goal args". Lines that are pure system wrappers
+// (`<local-command-caveat>`, `<local-command-stdout>`, …) aren't something the user typed
+// and yield None, so the next real prompt becomes the title. Whitespace is collapsed and
+// the result capped at 120 chars.
+fn prompt_title(raw: &str) -> Option<String> {
+    let tag = |name: &str| -> Option<String> {
+        let open = format!("<{}>", name);
+        let start = raw.find(&open)? + open.len();
+        let end = raw[start..].find(&format!("</{}>", name))? + start;
+        Some(raw[start..end].trim().to_string())
+    };
+    let text = if let Some(cmd) = tag("command-name") {
+        let args = tag("command-args").unwrap_or_default();
+        if args.is_empty() { cmd } else { format!("{} {}", cmd, args) }
+    } else if raw.trim_start().starts_with('<') && raw.trim_end().ends_with('>') && raw.contains("</") {
+        return None;
+    } else {
+        raw.to_string()
+    };
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() { None } else { Some(collapsed.chars().take(120).collect()) }
+}
+
 fn parse_session(path: &std::path::Path, project_name: &str, project_path: &str) -> Option<SessionInfo> {
     let session_id = path.file_stem()?.to_string_lossy().to_string();
     let metadata = fs::metadata(path).ok()?;
@@ -259,7 +284,7 @@ fn parse_session(path: &std::path::Path, project_name: &str, project_path: &str)
                 if let Some(content) = content_node {
                     if let Some(s) = content.as_str() {
                         is_real_prompt = !s.is_empty();
-                        prompt_text = Some(s.chars().take(120).collect());
+                        prompt_text = Some(s.to_string());
                     } else if let Some(arr) = content.as_array() {
                         // Real prompt = at least one text/image part AND no tool_result parts.
                         let has_tool_result = arr.iter().any(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_result"));
@@ -271,7 +296,7 @@ fn parse_session(path: &std::path::Path, project_name: &str, project_path: &str)
                         if is_real_prompt {
                             for item in arr {
                                 if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                                    prompt_text = Some(text.chars().take(120).collect());
+                                    prompt_text = Some(text.to_string());
                                     break;
                                 }
                             }
@@ -281,7 +306,7 @@ fn parse_session(path: &std::path::Path, project_name: &str, project_path: &str)
                 if is_real_prompt {
                     message_count += 1;
                     if first_human_message.is_empty() {
-                        if let Some(t) = prompt_text { first_human_message = t; }
+                        if let Some(t) = prompt_text.as_deref().and_then(prompt_title) { first_human_message = t; }
                     }
                 }
             }
@@ -505,8 +530,10 @@ fn parse_codex_session(path: &std::path::Path, names: &HashMap<String, String>) 
                 Some("user_message") => {
                     message_count += 1;
                     if first_user_message.is_empty() {
-                        if let Some(m) = payload.get("message").and_then(|v| v.as_str()) {
-                            first_user_message = m.trim().replace('\n', " ").chars().take(120).collect();
+                        // Same cleaning as Claude titles (Codex can import Claude sessions,
+                        // slash-command markup included).
+                        if let Some(t) = payload.get("message").and_then(|v| v.as_str()).and_then(prompt_title) {
+                            first_user_message = t;
                         }
                     }
                 }
