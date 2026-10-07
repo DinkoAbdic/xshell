@@ -7,16 +7,17 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
-import { GitBranch, ArrowUp, ArrowDown, RefreshCw, ChevronRight, ChevronDown, Plus, Minus, History, GitFork, Pencil, X as XIcon, Check, Search, AlertTriangle, Cloud, FolderTree, FileDiff, RotateCcw } from "lucide-react";
+import { GitBranch, ArrowUp, ArrowDown, RefreshCw, ChevronRight, ChevronDown, Plus, Minus, History, GitFork, Pencil, X as XIcon, Check, Search, AlertTriangle, Cloud, FolderTree, FileDiff, RotateCcw, Square, FolderGit2 } from "lucide-react";
 import { FileExplorerPanel, DRAG_PATH_MIME } from "./FileExplorerPanel";
 import { fileIconUrl, plainFolderIconUrl } from "../lib/fileIcons";
 import "@xterm/xterm/css/xterm.css";
 import { detectMonoFontFamily, ensureMonoFontsLoaded } from "../lib/fonts";
-import type { Tab, GitStatus, GitFile, GitCommit, BranchInfo, SessionInfo, GitBranch as GitBranchEntry } from "../types";
+import type { Tab, GitStatus, GitFile, GitCommit, BranchInfo, SessionInfo, GitBranch as GitBranchEntry, DevServer, GitRepo } from "../types";
 import { getShellById } from "../shells";
 import { AGENTS } from "../agents";
 import type { ThemeMode } from "./SettingsView";
 import { useAgentDataChanged } from "../hooks/useAgentDataChanged";
+import { SelectMenu } from "./SelectMenu";
 import { useWindowVisible } from "../hooks/useWindowVisible";
 
 const DEFAULT_FONT_SIZE = 14;
@@ -141,6 +142,9 @@ const WEBGL_RELEASE_DELAY_MS = 10000;
 interface TerminalTabProps {
   tab: Tab;
   isActive: boolean;
+  // Local dev servers started by this tab's session or running in its project folder.
+  devServers: DevServer[];
+  onStopDevServer: (pid: number) => void;
   // On screen (the active tab, or any pane of the active split group). Hidden tabs release
   // their WebGL context.
   isVisible: boolean;
@@ -215,7 +219,7 @@ const DEFAULT_PANEL = 280;
 // panel is dragged to its widest, so it can cover almost the whole terminal but stay grabbable.
 const PANEL_EDGE_RESERVE = 76;
 
-export function TerminalTab({ tab, isActive, isVisible, gitLazyPolling, gitChangesTree, fileExplorerOnStart, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, scrollback, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch }: TerminalTabProps) {
+export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisible, gitLazyPolling, gitChangesTree, fileExplorerOnStart, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, scrollback, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch }: TerminalTabProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -247,6 +251,47 @@ export function TerminalTab({ tab, isActive, isVisible, gitLazyPolling, gitChang
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [gitCommits, setGitCommits] = useState<GitCommit[]>([]);
   const [gitRefreshing, setGitRefreshing] = useState(false);
+  // Git repositories inside the project (the folder itself and/or subfolders, like VS Code's
+  // repository scan). The git panel works on one at a time: `gitCwd`. The user's pick is
+  // remembered per project; until they pick, the first repo with changes is used.
+  const [gitRepos, setGitRepos] = useState<GitRepo[]>([]);
+  const [repoChangeCounts, setRepoChangeCounts] = useState<Record<string, number>>({});
+  const repoPrefKey = tab.projectPath ? `xshell.gitRepo:${tab.projectPath.toLowerCase()}` : "";
+  const [pickedRepo, setPickedRepo] = useState<string | null>(() => {
+    try { return repoPrefKey ? localStorage.getItem(repoPrefKey) : null; } catch (_) { return null; }
+  });
+  const gitCwd = useMemo(() => {
+    if (!tab.projectPath) return undefined;
+    if (gitRepos.length === 0) return tab.projectPath;
+    const picked = pickedRepo && gitRepos.find(r => r.path === pickedRepo);
+    if (picked) return picked.path;
+    return (gitRepos.find(r => (repoChangeCounts[r.path] || 0) > 0) ?? gitRepos[0]).path;
+  }, [tab.projectPath, gitRepos, pickedRepo, repoChangeCounts]);
+  const pickRepo = useCallback((path: string) => {
+    setPickedRepo(path);
+    try { if (repoPrefKey) localStorage.setItem(repoPrefKey, path); } catch (_) {}
+  }, [repoPrefKey]);
+  const findRepos = useCallback(() => {
+    if (!tab.projectPath) return;
+    invoke<GitRepo[]>("find_git_repos", { root: tab.projectPath })
+      .then(repos => setGitRepos(prev => (JSON.stringify(prev) === JSON.stringify(repos) ? prev : repos)))
+      .catch(() => setGitRepos([]));
+  }, [tab.projectPath]);
+  // Raw shells have no git chrome, so they skip the scan.
+  useEffect(() => { if ((tab.shellMode || "claude") === "claude") findRepos(); }, [findRepos, tab.shellMode]);
+  // Change counts for every repo (picker labels and the activity-bar badge): one `git status`
+  // per repo, at most every 10s unless forced (the selected repo itself refreshes every 3s).
+  const repoCountsAtRef = useRef(0);
+  const fetchRepoCounts = useCallback(async (force = false) => {
+    if (gitRepos.length < 2) return;
+    if (!force && Date.now() - repoCountsAtRef.current < 10000) return;
+    repoCountsAtRef.current = Date.now();
+    const entries = await Promise.all(gitRepos.map(r =>
+      invoke<GitStatus>("get_git_status", { cwd: r.path }).then(s => [r.path, s.files?.length || 0] as const).catch(() => [r.path, 0] as const)));
+    const next = Object.fromEntries(entries);
+    setRepoChangeCounts(prev => (JSON.stringify(prev) === JSON.stringify(next) ? prev : next));
+  }, [gitRepos]);
+  useEffect(() => { fetchRepoCounts(true); }, [fetchRepoCounts]);
   // The git panel's bottom area is a Diff/History tab pair. History shows by default; clicking
   // a changed file in the status list switches to Diff and loads that file's diff.
   // Top-level git-panel tabs: "changes" (file list + diff) and "history" (commit log).
@@ -688,10 +733,10 @@ export function TerminalTab({ tab, isActive, isVisible, gitLazyPolling, gitChang
   // Fetch git status (async, non-blocking). Diffs against the previous snapshot and flags
   // newly-changed files so the UI can blink them for the user.
   const fetchGitStatus = useCallback(async () => {
-    if (!tab.projectPath) return;
+    if (!gitCwd) return;
     setGitRefreshing(true);
     try {
-      const status = await invoke<GitStatus>("get_git_status", { cwd: tab.projectPath });
+      const status = await invoke<GitStatus>("get_git_status", { cwd: gitCwd });
       const currentKeys = new Set((status.files || []).map(fileKey));
       // "Changed since last poll" = keys present now that weren't present before. This
       // captures new files, newly-staged, newly-modified, etc. Pure removals aren't flagged
@@ -717,50 +762,59 @@ export function TerminalTab({ tab, isActive, isVisible, gitLazyPolling, gitChang
     } finally {
       setGitRefreshing(false);
     }
-  }, [tab.projectPath]);
+    fetchRepoCounts();
+  }, [gitCwd, fetchRepoCounts]);
+
+  // Switching repos: forget the previous repo's file snapshot (no false "changed" blinks)
+  // and its open diff.
+  useEffect(() => {
+    prevFileKeysRef.current = new Set();
+    gitPolledOnceRef.current = false;
+    setSelectedDiff(null);
+  }, [gitCwd]);
 
   const fetchGitLog = useCallback(async () => {
-    if (!tab.projectPath) return;
+    if (!gitCwd) return;
     try {
-      const commits = await invoke<GitCommit[]>("get_git_log", { cwd: tab.projectPath, limit: 25 });
+      const commits = await invoke<GitCommit[]>("get_git_log", { cwd: gitCwd, limit: 25 });
       setGitCommits(commits);
     } catch (_) { setGitCommits([]); }
-  }, [tab.projectPath]);
+  }, [gitCwd]);
 
   const handleStageFile = useCallback(async (path: string) => {
     if (!tab.projectPath) return;
-    try { await invoke("git_stage", { cwd: tab.projectPath, paths: [path] }); } catch (_) {}
+    try { await invoke("git_stage", { cwd: gitCwd, paths: [path] }); } catch (_) {}
     fetchGitStatus();
-  }, [tab.projectPath, fetchGitStatus]);
+  }, [gitCwd, fetchGitStatus]);
 
   const handleUnstageFile = useCallback(async (path: string) => {
     if (!tab.projectPath) return;
-    try { await invoke("git_unstage", { cwd: tab.projectPath, paths: [path] }); } catch (_) {}
+    try { await invoke("git_unstage", { cwd: gitCwd, paths: [path] }); } catch (_) {}
     fetchGitStatus();
-  }, [tab.projectPath, fetchGitStatus]);
+  }, [gitCwd, fetchGitStatus]);
 
   // Bulk stage/unstage — the +/- button on a section header stages (or unstages) every file in it.
   const handleStageAll = useCallback(async (paths: string[]) => {
     if (!tab.projectPath || paths.length === 0) return;
-    try { await invoke("git_stage", { cwd: tab.projectPath, paths }); } catch (_) {}
+    try { await invoke("git_stage", { cwd: gitCwd, paths }); } catch (_) {}
     fetchGitStatus();
-  }, [tab.projectPath, fetchGitStatus]);
+  }, [gitCwd, fetchGitStatus]);
 
   const handleUnstageAll = useCallback(async (paths: string[]) => {
     if (!tab.projectPath || paths.length === 0) return;
-    try { await invoke("git_unstage", { cwd: tab.projectPath, paths }); } catch (_) {}
+    try { await invoke("git_unstage", { cwd: gitCwd, paths }); } catch (_) {}
     fetchGitStatus();
-  }, [tab.projectPath, fetchGitStatus]);
+  }, [gitCwd, fetchGitStatus]);
 
   // Discard a file's changes (destructive — the context menu confirms first). Section-scoped:
   // unstaged drops only the working-tree edits (keeps staged), staged reverts to HEAD, untracked
   // deletes. Clears the diff selection if it was that file.
   const handleDiscardFile = useCallback(async (path: string, mode: DiffMode) => {
     if (!tab.projectPath) return;
-    try { await invoke("git_discard", { cwd: tab.projectPath, path, mode }); } catch (_) {}
+    try { await invoke("git_discard", { cwd: gitCwd, path, mode }); } catch (_) {}
     setSelectedDiff(prev => (prev && prev.path === path ? null : prev));
     fetchGitStatus();
-  }, [tab.projectPath, fetchGitStatus]);
+  }, [gitCwd, fetchGitStatus]);
 
   // Surface a checkout failure as a thin banner; auto-dismisses so it doesn't linger.
   const showCheckoutError = useCallback((msg: string) => {
@@ -785,7 +839,7 @@ export function TerminalTab({ tab, isActive, isVisible, gitLazyPolling, gitChang
     }
     setCheckoutInFlight(true);
     try {
-      await invoke("git_checkout", { cwd: tab.projectPath, branch });
+      await invoke("git_checkout", { cwd: gitCwd, branch });
       dismissCheckoutError();
       setBranchDropdown(null);
       // Refresh status immediately so the chip updates without waiting for the 3s tick.
@@ -795,7 +849,7 @@ export function TerminalTab({ tab, isActive, isVisible, gitLazyPolling, gitChang
     } finally {
       setCheckoutInFlight(false);
     }
-  }, [tab.projectPath, checkoutInFlight, gitStatus, fetchGitStatus, showCheckoutError, dismissCheckoutError]);
+  }, [gitCwd, checkoutInFlight, gitStatus, fetchGitStatus, showCheckoutError, dismissCheckoutError]);
 
   // Seed the known-ids set once per tab-session attachment. Any jsonl present now is
   // "pre-existing" and won't be flagged as a fork of us. Runs async; checkBranch gates
@@ -1013,6 +1067,8 @@ export function TerminalTab({ tab, isActive, isVisible, gitLazyPolling, gitChang
   const unstagedFiles = (gitStatus?.files || []).filter(f => f.unstaged !== " " && f.staged !== "?");
   const untrackedFiles = (gitStatus?.files || []).filter(f => f.staged === "?");
   const totalChanges = (gitStatus?.files.length) || 0;
+  // With several repos in the project, the activity badge counts changes across all of them.
+  const badgeChanges = gitRepos.length > 1 ? Object.values(repoChangeCounts).reduce((a, b) => a + b, 0) : totalChanges;
 
   // On opening the git panel (fresh terminal / after restart), default to showing the first
   // change's diff — pick the first file in display order (Staged → Changes → Untracked) when
@@ -1032,7 +1088,8 @@ export function TerminalTab({ tab, isActive, isVisible, gitLazyPolling, gitChang
     gitStatus?.behind ? `↓${gitStatus.behind} behind` : null,
     totalChanges ? `${totalChanges} changes` : null,
   ].filter(Boolean).join(" · ");
-  const gitButtonTooltip = `${showGitPanel ? "Hide" : "Show"} git panel — ${gitStatus?.branch || "detached"}${gitCounts ? ` (${gitCounts})` : ""}`;
+  const repoLabel = gitRepos.length > 1 && gitCwd ? `${gitRepos.find(r => r.path === gitCwd)?.rel || "project root"} · ` : "";
+  const gitButtonTooltip = `${showGitPanel ? "Hide" : "Show"} git panel — ${repoLabel}${gitStatus?.branch || "detached"}${gitCounts ? ` (${gitCounts})` : ""}${gitRepos.length > 1 ? ` · ${gitRepos.length} repos, ${badgeChanges} changes in total` : ""}`;
 
   // Cost/context strip is only meaningful when xshell-stats has populated authoritative
   // numbers for this session AND the user hasn't opted out via the Agents tab toggle.
@@ -1064,6 +1121,25 @@ export function TerminalTab({ tab, isActive, isVisible, gitLazyPolling, gitChang
         ) : tab.projectPath ? (
           <span className="terminal-header-path" data-tauri-drag-region>{tab.projectPath}</span>
         ) : null}
+        {devServers.length > 0 && (
+          <div className="terminal-devservers">
+            {devServers.map(s => {
+              const url = `http://localhost:${s.port}`;
+              const origin = s.tab_id === tab.id ? "Started by this session" : "Running in this project";
+              return (
+                <span key={`${s.pid}:${s.port}`} className="devserver-chip">
+                  <button className="devserver-open" onClick={() => invoke("open_url", { url }).catch(() => {})} onMouseEnter={(e) => showTt(`${origin} (${s.process_name}, PID ${s.pid}, in ${s.cwd}). Click to open ${url}`, e.currentTarget)} onMouseLeave={hideTt}>
+                    <span className="devserver-dot" />
+                    localhost:{s.port}
+                  </button>
+                  <button className="devserver-stop" onClick={() => onStopDevServer(s.pid)} onMouseEnter={(e) => showTt(`Stop the server on port ${s.port}`, e.currentTarget)} onMouseLeave={hideTt}>
+                    <Square size={8} />
+                  </button>
+                </span>
+              );
+            })}
+          </div>
+        )}
       </div>
       {branchNotice && (
         <div className="branch-banner">
@@ -1133,6 +1209,16 @@ export function TerminalTab({ tab, isActive, isVisible, gitLazyPolling, gitChang
           <>
             <div className="terminal-splitter" onPointerDown={onSplitterDown} onMouseEnter={(e) => showTt("Drag to resize", e.currentTarget)} onMouseLeave={hideTt} />
             <div className="terminal-side-panel" style={{ width: gitPanelWidth }}>
+              {gitRepos.length > 1 && gitCwd && (
+                <div className="git-repo-picker">
+                  <FolderGit2 size={12} className="git-repo-picker-icon" />
+                  <SelectMenu value={gitCwd} onChange={pickRepo}
+                    options={gitRepos.map(r => {
+                      const n = repoChangeCounts[r.path] || 0;
+                      return { value: r.path, label: `${r.rel || r.path.split(/[\\/]/).filter(Boolean).pop() || r.path}${n ? ` (${n})` : ""}` };
+                    })} />
+                </div>
+              )}
               <div className="git-panel-header">
                 <GitBranch size={12} />
                 <button
@@ -1175,7 +1261,7 @@ export function TerminalTab({ tab, isActive, isVisible, gitLazyPolling, gitChang
                   <div className="git-hsplitter" onPointerDown={onGitBottomSplitterDown} onMouseEnter={(e) => showTt("Drag to resize", e.currentTarget)} onMouseLeave={hideTt} />
                   <div className="git-bottom" style={{ height: gitBottomHeight }}>
                     <div className="git-tab-body">
-                      <DiffView cwd={tab.projectPath || "."} file={selectedDiff} version={gitTick} />
+                      <DiffView cwd={gitCwd || "."} file={selectedDiff} version={gitTick} />
                     </div>
                   </div>
                 </>
@@ -1204,7 +1290,7 @@ export function TerminalTab({ tab, isActive, isVisible, gitLazyPolling, gitChang
         {isClaudeSession && (
           <div className="terminal-activity-bar">
             {(() => {
-              const gitDisabled = !gitStatus?.is_repo;
+              const gitDisabled = !gitStatus?.is_repo && gitRepos.length === 0;
               const tip = gitDisabled ? "Not a git repository" : gitButtonTooltip;
               return (
                 <button
@@ -1216,7 +1302,7 @@ export function TerminalTab({ tab, isActive, isVisible, gitLazyPolling, gitChang
                   aria-label="Toggle git panel"
                 >
                   <GitBranch size={15} />
-                  {!gitDisabled && totalChanges > 0 && <span className="terminal-activity-badge">{totalChanges > 99 ? "99+" : totalChanges}</span>}
+                  {!gitDisabled && badgeChanges > 0 && <span className="terminal-activity-badge">{badgeChanges > 99 ? "99+" : badgeChanges}</span>}
                 </button>
               );
             })()}
@@ -1256,9 +1342,9 @@ export function TerminalTab({ tab, isActive, isVisible, gitLazyPolling, gitChang
           </div>
         </>
       )}
-      {branchDropdown && tab.projectPath && gitStatus && (
+      {branchDropdown && gitCwd && gitStatus && (
         <BranchDropdown
-          cwd={tab.projectPath}
+          cwd={gitCwd}
           currentBranch={gitStatus.branch}
           dirty={(gitStatus.files?.length || 0) > 0}
           busy={checkoutInFlight}

@@ -26,6 +26,8 @@ uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 md5 = "0.7"
 notify = "8"
+listeners = "0.6"
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 # Dev profile: fast incremental rebuilds, light optimization for deps
 [profile.dev]

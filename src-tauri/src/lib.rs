@@ -1810,6 +1810,46 @@ fn parse_porcelain(output: &str) -> GitStatus {
     status
 }
 
+// Git repositories inside a project folder, like VS Code's repository scan: the folder itself
+// when it is a repo, plus repos in subfolders up to GIT_REPO_SCAN_DEPTH levels down. A project
+// such as a client folder holding several separate repos gets one entry per repo. Dependency,
+// build and hidden folders are skipped, and the scan doesn't descend into a nested repo it found.
+const GIT_REPO_SCAN_DEPTH: usize = 3;
+const GIT_REPO_SCAN_SKIP: [&str; 9] = ["node_modules", "target", "dist", "build", "out", "vendor", "bin", "obj", "__pycache__"];
+
+#[derive(Debug, Serialize, Clone)]
+pub struct GitRepo {
+    pub path: String,
+    // Path relative to the project folder ("" for the project folder itself).
+    pub rel: String,
+}
+
+fn find_git_repos(root: String) -> Vec<GitRepo> {
+    let root_path = PathBuf::from(&root);
+    let is_repo = |p: &std::path::Path| p.join(".git").exists(); // dir, or file for worktrees/submodules
+    let mut repos: Vec<GitRepo> = vec![];
+    if is_repo(&root_path) { repos.push(GitRepo { path: root.clone(), rel: String::new() }); }
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root_path.clone(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth >= GIT_REPO_SCAN_DEPTH { continue; }
+        for entry in fs::read_dir(&dir).ok().into_iter().flatten().flatten() {
+            if !entry.file_type().map_or(false, |ft| ft.is_dir()) { continue; }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || GIT_REPO_SCAN_SKIP.contains(&name.as_str()) { continue; }
+            let p = entry.path();
+            if is_repo(&p) {
+                let rel = p.strip_prefix(&root_path).map(|r| r.to_string_lossy().into_owned()).unwrap_or_default();
+                repos.push(GitRepo { path: p.to_string_lossy().into_owned(), rel });
+            } else {
+                stack.push((p, depth + 1));
+            }
+        }
+    }
+    // Project folder first, then nested repos alphabetically.
+    repos.sort_by(|a, b| (!a.rel.is_empty(), a.rel.to_lowercase()).cmp(&(!b.rel.is_empty(), b.rel.to_lowercase())));
+    repos
+}
+
 #[tauri::command]
 async fn get_git_status(cwd: String) -> GitStatus {
     use std::process::Command;
@@ -2311,6 +2351,12 @@ fn spawn_terminal(state: State<'_, AppState>, id: String, session_id: Option<Str
     // (telemetry reads `terminal.type` from TERM_PROGRAM; without this we'd land in the
     // Unknown bucket). Always set — no user-facing toggle.
     cmd.env("TERM_PROGRAM", "xshell.sh");
+    // Lets list_dev_servers tie a server back to the tab whose session started it
+    // (inherited by every child, including through Git Bash).
+    cmd.env("XSHELL_TAB_ID", &id);
+    // When xshell itself was started from inside a Claude Code session (e.g. `tauri dev` run by
+    // an agent), this marker is inherited and makes every Claude tab skip saving transcripts.
+    cmd.env_remove("CLAUDE_CODE_CHILD_SESSION");
     // Claude Code's flicker-free / alternate-screen-buffer renderer is opt-in via env var.
     // Default OFF (it disables scrollback, so the terminal scrollbar would be empty); raw
     // shells never get it (no claude process to read it).
@@ -3594,6 +3640,104 @@ async fn detect_agent_binary(binary: String) -> Result<AgentBinaryProbe, String>
 
 // ── App Setup ──────────────────────────────────────────────────────────
 
+// ── Dev servers ───────────────────────────────────────────────────────
+// Local servers (npm run dev, astro dev, …) that an agent or the user started for a project.
+// Claude Code runs commands through Git Bash, whose fork emulation breaks the Windows
+// parent-process chain, so servers can't be found by walking xshell's process tree. Instead,
+// every listening TCP socket on a local address is matched by its owning process's
+// environment (XSHELL_TAB_ID, set on each spawned tab and inherited through any shell) and
+// working directory (inside an added project folder).
+#[derive(Debug, Serialize, Clone)]
+pub struct DevServer {
+    pub port: u16,
+    pub pid: u32,
+    pub process_name: String,
+    pub cwd: String,
+    // Deepest added project folder containing cwd; empty when only the tab marker matched.
+    pub project_path: String,
+    // The xshell tab whose session started the server, when known.
+    pub tab_id: Option<String>,
+}
+
+// Ports from the OS's dynamic range (Windows and IANA: 49152+) are picked at random for
+// short-lived helpers (auth callbacks, tool servers); dev servers use fixed lower ports.
+const DEV_SERVER_MAX_PORT: u16 = 49151;
+
+// Agent CLIs and xshell itself may hold sockets of their own; those aren't dev servers.
+const DEV_SERVER_IGNORED_PROCESSES: [&str; 6] = ["claude", "codex", "cursor-agent", "opencode", "agy", "xshell"];
+
+fn path_within(child: &str, parent: &str) -> bool {
+    let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    let (c, p) = (norm(child), norm(parent));
+    !p.is_empty() && (c == p || c.starts_with(&format!("{}\\", p)))
+}
+
+fn list_dev_servers(project_paths: Vec<String>) -> Vec<DevServer> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let Ok(all) = listeners::get_all() else { return vec![] };
+    let own_pid = std::process::id();
+    // (pid, port, process name), one entry per port even when bound on IPv4 and IPv6.
+    let mut sockets: Vec<(u32, u16, String)> = vec![];
+    for l in all {
+        let ip = l.socket.ip();
+        if l.protocol != listeners::Protocol::TCP || !(ip.is_loopback() || ip.is_unspecified()) || l.process.pid == own_pid { continue; }
+        if l.socket.port() > DEV_SERVER_MAX_PORT { continue; }
+        let lower = l.process.name.to_lowercase();
+        if DEV_SERVER_IGNORED_PROCESSES.iter().any(|n| lower.starts_with(n)) { continue; }
+        if !sockets.iter().any(|(pid, port, _)| *pid == l.process.pid && *port == l.socket.port()) {
+            sockets.push((l.process.pid, l.socket.port(), l.process.name.clone()));
+        }
+    }
+    if sockets.is_empty() { return vec![]; }
+
+    let mut pids: Vec<Pid> = sockets.iter().map(|(pid, _, _)| Pid::from_u32(*pid)).collect();
+    pids.dedup();
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true,
+        ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always).with_environ(UpdateKind::Always));
+
+    let mut out: Vec<DevServer> = vec![];
+    for (pid, port, process_name) in sockets {
+        let Some(p) = sys.process(Pid::from_u32(pid)) else { continue };
+        let cwd = p.cwd().map(|c| c.to_string_lossy().into_owned()).unwrap_or_default();
+        let tab_id = p.environ().iter().find_map(|e| e.to_string_lossy().strip_prefix("XSHELL_TAB_ID=").map(|s| s.to_string()));
+        let project_path = project_paths.iter().filter(|pp| path_within(&cwd, pp)).max_by_key(|pp| pp.len()).cloned();
+        if project_path.is_none() && tab_id.is_none() { continue; }
+        out.push(DevServer { port, pid, process_name, cwd, project_path: project_path.unwrap_or_default(), tab_id });
+    }
+    out.sort_by_key(|s| s.port);
+    out
+}
+
+// Stops a server listed by list_dev_servers (re-checked here, so the frontend can't use this
+// to kill arbitrary processes). On Windows the whole process tree goes, so helper processes
+// (esbuild, workers) don't linger.
+fn stop_dev_server(pid: u32, project_paths: Vec<String>) -> Result<(), String> {
+    if !list_dev_servers(project_paths).iter().any(|s| s.pid == pid) {
+        return Err("not a running dev server".into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .status()
+            .map_err(|e| e.to_string())?;
+        if status.success() { Ok(()) } else { Err(format!("taskkill exited with {}", status)) }
+    }
+    #[cfg(not(windows))]
+    {
+        let mut sys = sysinfo::System::new();
+        let p = sysinfo::Pid::from_u32(pid);
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true);
+        match sys.process(p) {
+            Some(proc_) if proc_.kill() => Ok(()),
+            _ => Err("could not stop process".into()),
+        }
+    }
+}
+
 // ── Agent data watcher ────────────────────────────────────────────────
 // Watches the directories the agent CLIs write session data to and emits
 // `agent-data-changed` with the agents whose data changed, so the UI refreshes on change
@@ -3695,6 +3839,21 @@ mod bg {
     #[tauri::command]
     pub async fn get_sessions_for_projects(encoded_names: Vec<String>) -> Result<HashMap<String, Vec<SessionInfo>>, String> {
         tauri::async_runtime::spawn_blocking(move || super::get_sessions_for_projects(encoded_names)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn find_git_repos(root: String) -> Result<Vec<GitRepo>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::find_git_repos(root)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn list_dev_servers(project_paths: Vec<String>) -> Result<Vec<DevServer>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::list_dev_servers(project_paths)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn stop_dev_server(pid: u32, project_paths: Vec<String>) -> Result<(), String> {
+        tauri::async_runtime::spawn_blocking(move || super::stop_dev_server(pid, project_paths)).await.map_err(|e| e.to_string())?
     }
 
     #[tauri::command]
@@ -3837,7 +3996,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(AppState { terminals: Mutex::new(HashMap::new()) })
         .setup(|app| { start_agent_data_watcher(app.handle().clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![bg::list_claude_projects, bg::get_sessions, bg::get_sessions_for_projects, bg::get_all_recent_sessions, bg::get_session_messages, bg::read_image_base64, bg::save_dropped_file, bg::read_text_file, reveal_in_explorer, list_dir, search_dir, open_url, get_username, get_home_dir, bg::get_project_skills, bg::get_project_memories, get_git_status, get_git_log, git_diff, bg::git_stage, bg::git_unstage, git_discard, bg::list_git_branches, bg::git_checkout, bg::list_project_session_ids, bg::detect_session_branch, bg::probe_statusline_setup, bg::get_global_rate_limits, detect_agent_binary, bg::list_codex_projects, bg::list_cursor_projects, bg::list_opencode_projects, bg::list_antigravity_projects, bg::get_codex_context, bg::get_cursor_context, bg::get_opencode_context, bg::get_antigravity_context, bg::get_claude_cost_summary, bg::get_codex_usage, spawn_terminal, write_terminal, resize_terminal, close_terminal])
+        .invoke_handler(tauri::generate_handler![bg::list_claude_projects, bg::get_sessions, bg::get_sessions_for_projects, bg::list_dev_servers, bg::find_git_repos, bg::stop_dev_server, bg::get_all_recent_sessions, bg::get_session_messages, bg::read_image_base64, bg::save_dropped_file, bg::read_text_file, reveal_in_explorer, list_dir, search_dir, open_url, get_username, get_home_dir, bg::get_project_skills, bg::get_project_memories, get_git_status, get_git_log, git_diff, bg::git_stage, bg::git_unstage, git_discard, bg::list_git_branches, bg::git_checkout, bg::list_project_session_ids, bg::detect_session_branch, bg::probe_statusline_setup, bg::get_global_rate_limits, detect_agent_binary, bg::list_codex_projects, bg::list_cursor_projects, bg::list_opencode_projects, bg::list_antigravity_projects, bg::get_codex_context, bg::get_cursor_context, bg::get_opencode_context, bg::get_antigravity_context, bg::get_claude_cost_summary, bg::get_codex_usage, spawn_terminal, write_terminal, resize_terminal, close_terminal])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
