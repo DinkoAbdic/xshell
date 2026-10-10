@@ -24,6 +24,8 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { MIN_UI_ZOOM, MAX_UI_ZOOM, UI_ZOOM_STEP } from "./components/SettingsView";
 import { UpdateDialog } from "./components/UpdateDialog";
 import { useDevServers, devServersForTab } from "./hooks/useDevServers";
+import { useRemoteCheck } from "./hooks/useRemoteCheck";
+import { PullPromptDialog } from "./components/PullPromptDialog";
 import type { DevServer } from "./types";
 
 // Flatten sidebar items to an ordered list of project paths (folders expanded in place).
@@ -594,6 +596,9 @@ export default function App() {
     }
     return map;
   }, [devServers, tabs]);
+  // Projects open in tabs are fetched on launch, when a tab opens and every 15 min; a branch
+  // that is behind its upstream (pushed from another computer) gets a pull prompt.
+  const { prompts: pullPrompts, decline: declinePullPrompt, resolve: resolvePullPrompt } = useRemoteCheck(tabs, tabsRestored);
   const handleStopDevServer = useCallback(async (pid: number) => {
     try { await invoke("stop_dev_server", { pid, projectPaths: devServerPaths }); } catch (_) {}
     refreshDevServers();
@@ -1316,6 +1321,10 @@ export default function App() {
         return <ProjectEditorDialog project={proj} settings={settings} onSave={(s) => handleSaveProjectSettings(editingProjectPath, s)} onClose={() => setEditingProjectPath(null)} />;
       })()}
       {updateDialogOpen && <UpdateDialog info={updateInfo} onDismiss={dismissUpdateDialog} />}
+      {!updateDialogOpen && pullPrompts.length > 0 && (
+        <PullPromptDialog prompt={pullPrompts[0]} remaining={pullPrompts.length - 1}
+          onPulled={() => resolvePullPrompt(pullPrompts[0].key)} onLater={() => declinePullPrompt(pullPrompts[0].key)} />
+      )}
     </div>
   );
 }
