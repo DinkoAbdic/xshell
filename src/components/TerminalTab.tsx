@@ -418,6 +418,12 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
     term.loadAddon(new Unicode11Addon());
     term.unicode.activeVersion = "11";
 
+    // Set by the cleanup below. The spawn waits on fonts and layout, so it can still be pending
+    // when this effect is torn down: React StrictMode (dev) mounts every component twice and tears
+    // the first mount down at once. A torn-down terminal must not spawn, or the same tab id gets
+    // two PTYs (two claude processes on one session).
+    let disposed = false;
+
     term.open(containerRef.current);
     terminalRef.current = term;
     fitAddonRef.current = fitAddon;
@@ -523,9 +529,11 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
       const el = containerRef.current;
       if (!el) return;
       const tick = () => {
+        if (disposed) return;
         if (el.offsetWidth > 0 && el.offsetHeight > 0) {
           // One extra rAF lets any pending flex/layout work flush before we measure.
           requestAnimationFrame(() => {
+            if (disposed) return;
             fitAddon.fit();
             spawnBackend(term, fitAddon);
           });
@@ -536,7 +544,7 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
           // moment the host is reparented into a visible slot, so claude gets the right
           // dimensions on first view. Without this, every restored tab waits to spawn
           // until the user clicks it, which makes the launch experience feel sluggish.
-          requestAnimationFrame(() => spawnBackend(term, fitAddon));
+          requestAnimationFrame(() => { if (!disposed) spawnBackend(term, fitAddon); });
         } else {
           requestAnimationFrame(tick);
         }
@@ -655,6 +663,7 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
 
     const containerEl = containerRef.current;
     return () => {
+      disposed = true;
       resizeObserver.disconnect();
       intersectionObserver.disconnect();
       containerEl?.removeEventListener("contextmenu", onContextMenu);
