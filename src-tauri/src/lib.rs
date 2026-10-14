@@ -1641,14 +1641,18 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
     let mut cmd;
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         cmd = Command::new("explorer.exe");
+        // Explorer parses its own command line: `"/select,C:\a b\x"` (what `arg` produces for a
+        // path with spaces) is not understood and it falls back to Documents. Pass the raw
+        // form `/select,"C:\a b\x"` instead. Explorer also rejects forward slashes.
+        let win_path = path.replace('/', "\\");
         if is_file {
             // `/select,<path>` opens the parent folder and highlights the file.
-            cmd.arg(format!("/select,{}", path));
+            cmd.raw_arg(format!("/select,\"{}\"", win_path));
         } else {
-            cmd.arg(&path);
+            cmd.raw_arg(format!("\"{}\"", win_path));
         }
-        use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
     #[cfg(target_os = "macos")]
