@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronRight, RefreshCw, Folder, ArrowUp, Search, X as XIcon, FolderOpen, Terminal as TerminalIcon } from "lucide-react";
+import { ChevronRight, RefreshCw, Folder, ArrowUp, Search, X as XIcon, FolderOpen, Terminal as TerminalIcon, SquareTerminal } from "lucide-react";
 import type { DirItem } from "../types";
 import { AgentIcon, type AgentId } from "../agents";
 import { fileIconUrl, folderIconUrl } from "../lib/fileIcons";
@@ -67,7 +67,7 @@ interface RowProps {
 function FileRow({ item, depth, expanded, active, subtitle, onActivate, onContext, showTt, hideTt }: RowProps) {
   const agent = agentForDir(item);
   const iconUrl = agent ? "" : item.is_dir ? folderIconUrl(item.name, !!expanded) : fileIconUrl(item.name);
-  const tip = item.is_dir ? item.path : `${item.path} — click to reveal · drag to terminal`;
+  const tip = item.is_dir ? item.path : `${item.path} — click to open · drag to terminal`;
   const onDragStart = (e: React.DragEvent) => {
     e.dataTransfer.setData(DRAG_PATH_MIME, item.path);
     e.dataTransfer.setData("text/plain", item.path);
@@ -97,7 +97,7 @@ interface NodeProps {
   depth: number;
   tick: number;
   activePath: string | null;
-  onReveal: (path: string) => void;
+  onOpenFile: (path: string) => void;
   onContext: (x: number, y: number, item: DirItem) => void;
   showTt: (text: string, el: HTMLElement) => void;
   hideTt: () => void;
@@ -106,7 +106,7 @@ interface NodeProps {
 // One tree row + its lazily-loaded children. Children load on first expand and then stay
 // mounted (height-collapsed) so the open/close height transition is smooth and re-expanding
 // is instant. The grid-rows trick (0fr↔1fr) animates to the children's natural height.
-function Node({ item, depth, tick, activePath, onReveal, onContext, showTt, hideTt }: NodeProps) {
+function Node({ item, depth, tick, activePath, onOpenFile, onContext, showTt, hideTt }: NodeProps) {
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState<DirItem[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -131,7 +131,7 @@ function Node({ item, depth, tick, activePath, onReveal, onContext, showTt, hide
     return () => { alive = false; };
   }, [tick]);
 
-  const onActivate = () => { if (item.is_dir) setExpanded((v) => !v); else onReveal(item.path); };
+  const onActivate = () => { if (item.is_dir) setExpanded((v) => !v); else onOpenFile(item.path); };
   const childPad = 6 + (depth + 1) * 12 + 14;
 
   return (
@@ -144,7 +144,7 @@ function Node({ item, depth, tick, activePath, onReveal, onContext, showTt, hide
               ? (loading && expanded ? <div className="file-row file-row-muted" style={{ paddingLeft: childPad }}>Loading…</div> : null)
               : children.length === 0
                 ? <div className="file-row file-row-muted" style={{ paddingLeft: childPad }}>Empty</div>
-                : children.map((c) => <Node key={c.path} item={c} depth={depth + 1} tick={tick} activePath={activePath} onReveal={onReveal} onContext={onContext} showTt={showTt} hideTt={hideTt} />)}
+                : children.map((c) => <Node key={c.path} item={c} depth={depth + 1} tick={tick} activePath={activePath} onOpenFile={onOpenFile} onContext={onContext} showTt={showTt} hideTt={hideTt} />)}
           </div>
         </div>
       )}
@@ -156,6 +156,8 @@ interface PanelProps {
   rootPath: string;
   terminalId: string;
   visible: boolean;
+  onOpenFile: (path: string) => void; // opens a file in the code editor beside the terminal
+  onOpenTerminal: (folder: string) => void; // opens a shell in the bottom panel in that folder
   showTt: (text: string, el: HTMLElement) => void;
   hideTt: () => void;
 }
@@ -163,7 +165,7 @@ interface PanelProps {
 // Inner content of the file-explorer side panel — header (current dir + up/search/refresh) and
 // a scrollable area showing either the lazy tree or flat search results. TerminalTab wraps this
 // in the shared `.terminal-side-panel` + splitter, mirroring how the git panel is hosted.
-export function FileExplorerPanel({ rootPath, terminalId, visible, showTt, hideTt }: PanelProps) {
+export function FileExplorerPanel({ rootPath, terminalId, visible, onOpenFile, onOpenTerminal, showTt, hideTt }: PanelProps) {
   // The browsable root. Starts at the terminal's cwd but the up-button can climb past it.
   const [cwd, setCwd] = useState(rootPath);
   const [roots, setRoots] = useState<DirItem[] | null>(null);
@@ -276,21 +278,22 @@ export function FileExplorerPanel({ rootPath, terminalId, visible, showTt, hideT
           : results && results.length === 0 ? <div className="git-panel-empty">No matches</div>
           : (results || []).map((item) => {
               const sub = relDir(item.path, cwd, item.name);
-              const onActivate = () => { if (item.is_dir) { setCwd(item.path); setSearchOpen(false); setQuery(""); } else reveal(item.path); };
+              const onActivate = () => { if (item.is_dir) { setCwd(item.path); setSearchOpen(false); setQuery(""); } else onOpenFile(item.path); };
               return <FileRow key={item.path} item={item} depth={0} active={activePath === item.path} subtitle={sub || undefined} onActivate={onActivate} onContext={openContext} showTt={showTtDelayed} hideTt={hideTtNow} />;
             })
         ) : (
           <>
             {roots === null && <div className="git-panel-empty">Loading…</div>}
             {roots !== null && roots.length === 0 && <div className="git-panel-empty">Empty folder</div>}
-            {roots?.map((item) => <Node key={item.path} item={item} depth={0} tick={tick} activePath={activePath} onReveal={reveal} onContext={openContext} showTt={showTtDelayed} hideTt={hideTtNow} />)}
+            {roots?.map((item) => <Node key={item.path} item={item} depth={0} tick={tick} activePath={activePath} onOpenFile={onOpenFile} onContext={openContext} showTt={showTtDelayed} hideTt={hideTtNow} />)}
           </>
         )}
       </div>
       {ctx && (
         <>
           <div className="file-ctx-backdrop" onClick={() => setCtx(null)} onContextMenu={(e) => { e.preventDefault(); setCtx(null); }} />
-          <div className="file-ctx-menu" style={{ left: Math.min(ctx.x, window.innerWidth - 220), top: Math.min(ctx.y, window.innerHeight - 80) }}>
+          <div className="file-ctx-menu" style={{ left: Math.min(ctx.x, window.innerWidth - 220), top: Math.min(ctx.y, window.innerHeight - 110) }}>
+            {ctx.item.is_dir && <button className="file-ctx-item" onClick={() => { onOpenTerminal(ctx.item.path); setCtx(null); }}><SquareTerminal size={13} /><span>Open terminal here</span></button>}
             <button className="file-ctx-item" onClick={() => { reveal(ctx.item.path); setCtx(null); }}><FolderOpen size={13} /><span>Reveal in folder</span></button>
             <button className="file-ctx-item" onClick={() => { writePath(ctx.item.path); setCtx(null); }}><TerminalIcon size={13} /><span>Write path to terminal</span></button>
           </div>

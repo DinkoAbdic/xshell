@@ -25,6 +25,7 @@ import { MIN_UI_ZOOM, MAX_UI_ZOOM, UI_ZOOM_STEP } from "./components/SettingsVie
 import { UpdateDialog } from "./components/UpdateDialog";
 import { useDevServers, devServersForTab } from "./hooks/useDevServers";
 import { useRemoteCheck } from "./hooks/useRemoteCheck";
+import { ConfirmDialogHost } from "./components/ConfirmDialog";
 import { PullPromptDialog } from "./components/PullPromptDialog";
 import type { DevServer } from "./types";
 
@@ -106,6 +107,8 @@ export default function App() {
   const [gitChangesTree, setGitChangesTree] = useState(true);
   // When on (default), a newly opened agent terminal shows the file-explorer panel immediately.
   const [fileExplorerOnStart, setFileExplorerOnStart] = useState(true);
+  const [sidePanelSide, setSidePanelSide] = useState<"left" | "right">("right");
+  const [emulatedInputSelection, setEmulatedInputSelection] = useState(true);
   const [contextTreeEnabled, setContextTreeEnabled] = useState(true);
   // Both default to true: setting up the statusline hook is the meaningful gesture, the
   // toggles let the user hide either feature even with stats available.
@@ -222,7 +225,7 @@ export default function App() {
     (async () => {
       try {
         const store = await load("settings.json", { defaults: {}, autoSave: true });
-        const [paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, scrollback, storedZoom] = await Promise.all([
+        const [paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, scrollback, storedZoom, panelSide, inputSel] = await Promise.all([
           store.get<string[]>("project_paths"),
           store.get<Record<string, ProjectSettings>>("project_icons"),
           store.get<Tab[]>("open_tabs"),
@@ -253,6 +256,8 @@ export default function App() {
           store.get<boolean>("session_row_metrics_opencode"),
           store.get<number>("terminal_scrollback"),
           store.get<number>("ui_zoom"),
+          store.get<string>("side_panel_side"),
+          store.get<boolean>("emulated_input_selection"),
         ]);
         // Layout: prefer the explicit `sidebar_layout` if present; otherwise migrate
         // from the flat `project_paths` list by wrapping each path in a project item.
@@ -278,6 +283,8 @@ export default function App() {
         if (typeof rowMetrics === "boolean") setShowSessionRowMetrics(rowMetrics);
         if (typeof gitTree === "boolean") setGitChangesTree(gitTree);
         if (typeof fileExpOnStart === "boolean") setFileExplorerOnStart(fileExpOnStart);
+        if (panelSide === "left" || panelSide === "right") setSidePanelSide(panelSide);
+        if (typeof inputSel === "boolean") setEmulatedInputSelection(inputSel);
         if (typeof fsRender === "boolean") setFullscreenRendering(fsRender);
         if (typeof syncOut === "boolean") setForceSyncOutput(syncOut);
         if (typeof eagerInit === "boolean") setEagerInitTabs(eagerInit);
@@ -489,6 +496,16 @@ export default function App() {
   const persistFileExplorerOnStart = useCallback(async (enabled: boolean) => {
     setFileExplorerOnStart(enabled);
     try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("file_explorer_on_start", enabled); } catch (_) {}
+  }, []);
+
+  const persistSidePanelSide = useCallback(async (side: "left" | "right") => {
+    setSidePanelSide(side);
+    try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("side_panel_side", side); } catch (_) {}
+  }, []);
+
+  const persistEmulatedInputSelection = useCallback(async (enabled: boolean) => {
+    setEmulatedInputSelection(enabled);
+    try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("emulated_input_selection", enabled); } catch (_) {}
   }, []);
 
   const persistContextTreeEnabled = useCallback(async (enabled: boolean) => {
@@ -815,16 +832,20 @@ export default function App() {
   const [closingTabIds, setClosingTabIds] = useState<Set<string>>(new Set());
 
   const handleCloseTab = useCallback((id: string) => {
+    // Forget the closed tabs' open editor files (TerminalTab restores them per tab id).
+    const forgetEditor = (ids: string[]) => { for (const t of ids) { try { localStorage.removeItem(`xshell.editor:${t}`); } catch (_) {} } };
     // Group close: drop the group entry + all tabs that belong to it.
     const group = groupsRef.current.find(g => g.id === id);
     if (group) {
       const memberIds = collectLeafIds(group.layout);
+      forgetEditor(memberIds);
       if (activeTabId === id) setActiveTabId("home");
       setGroups(prev => prev.filter(g => g.id !== id));
       setTabs(prev => prev.filter(t => !memberIds.includes(t.id)));
       return;
     }
     // Standalone tab close (existing animated path).
+    forgetEditor([id]);
     setClosingTabIds(prev => new Set(prev).add(id));
     if (activeTabId === id) {
       const idx = tabsRef.current.findIndex(t => t.id === id);
@@ -1222,7 +1243,7 @@ export default function App() {
       <div className="main-content">
         {/* Settings view — hidden unless activeTabId === 'settings' */}
         <div style={{ display: showSettings ? "flex" : "none", flex: 1, overflow: "hidden" }}>
-          <SettingsView theme={theme} onSetTheme={persistTheme} uiZoom={uiZoom} onSetUiZoom={persistUiZoom} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} terminalScrollback={terminalScrollback} onSetTerminalScrollback={persistTerminalScrollback} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} />
+          <SettingsView theme={theme} onSetTheme={persistTheme} uiZoom={uiZoom} onSetUiZoom={persistUiZoom} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} sidePanelSide={sidePanelSide} onSetSidePanelSide={persistSidePanelSide} emulatedInputSelection={emulatedInputSelection} onSetEmulatedInputSelection={persistEmulatedInputSelection} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} terminalScrollback={terminalScrollback} onSetTerminalScrollback={persistTerminalScrollback} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} />
         </div>
         {/* Home view — hidden when a terminal tab is active */}
         <div style={{ display: showHome ? "flex" : "none", flex: 1, overflow: "hidden" }}>
@@ -1305,7 +1326,7 @@ export default function App() {
           // the subtree (which kills the PTY in TerminalTab's cleanup). Keying by tab.id
           // makes a reorder a pure move — the TerminalTab instance, xterm, and PTY survive.
           return createPortal(
-            <TerminalTab tab={tab} devServers={devServersByTab.get(tab.id) ?? NO_DEV_SERVERS} onStopDevServer={handleStopDevServer} isVisible={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId)} isActive={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId && activeLeafByGroup[tab.groupId] === tab.id)} gitLazyPolling={gitLazyPolling} gitChangesTree={gitChangesTree} fileExplorerOnStart={fileExplorerOnStart} terminalBgColor={terminalBgColor} defaultFontSize={defaultTerminalFontSize} defaultShellId={defaultShell} fullscreenRendering={fullscreenRendering} forceSyncOutput={forceSyncOutput} webglRendering={webglRendering} terminalFontWeight={terminalFontWeight} scrollback={terminalScrollback} eagerInit={eagerInitTabs} theme={theme} projectEncodedName={encodedName} showTerminalHeaderStats={showTerminalHeaderStats} onBranchSwitch={handleSwitchTabToBranch} />,
+            <TerminalTab tab={tab} devServers={devServersByTab.get(tab.id) ?? NO_DEV_SERVERS} onStopDevServer={handleStopDevServer} isVisible={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId)} isActive={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId && activeLeafByGroup[tab.groupId] === tab.id)} gitLazyPolling={gitLazyPolling} gitChangesTree={gitChangesTree} fileExplorerOnStart={fileExplorerOnStart} sidePanelSide={sidePanelSide} emulatedInputSelection={emulatedInputSelection} terminalBgColor={terminalBgColor} defaultFontSize={defaultTerminalFontSize} defaultShellId={defaultShell} fullscreenRendering={fullscreenRendering} forceSyncOutput={forceSyncOutput} webglRendering={webglRendering} terminalFontWeight={terminalFontWeight} scrollback={terminalScrollback} eagerInit={eagerInitTabs} theme={theme} projectEncodedName={encodedName} showTerminalHeaderStats={showTerminalHeaderStats} onBranchSwitch={handleSwitchTabToBranch} />,
             host,
             tab.id,
           );
@@ -1321,6 +1342,7 @@ export default function App() {
         return <ProjectEditorDialog project={proj} settings={settings} onSave={(s) => handleSaveProjectSettings(editingProjectPath, s)} onClose={() => setEditingProjectPath(null)} />;
       })()}
       {updateDialogOpen && <UpdateDialog info={updateInfo} onDismiss={dismissUpdateDialog} />}
+      <ConfirmDialogHost />
       {!updateDialogOpen && pullPrompts.length > 0 && (
         <PullPromptDialog prompt={pullPrompts[0]} remaining={pullPrompts.length - 1}
           onPulled={() => resolvePullPrompt(pullPrompts[0].key)} onLater={() => declinePullPrompt(pullPrompts[0].key)} />

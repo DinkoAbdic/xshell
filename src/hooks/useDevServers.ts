@@ -44,7 +44,8 @@ const normPath = (p: string) => p.replace(/\//g, "\\").replace(/\\+$/, "").toLow
 export function devServersForTab(servers: DevServer[], tabId: string, projectPath: string | undefined): DevServer[] {
   const root = projectPath ? normPath(projectPath) : "";
   return servers.filter(s => {
-    if (s.tab_id === tabId) return true;
+    // Shells in a tab's bottom panel run under `<tab id>::shell-<n>`.
+    if (s.tab_id === tabId || s.tab_id?.startsWith(tabId + "::")) return true;
     if (!root) return false;
     const cwd = normPath(s.cwd);
     return cwd === root || cwd.startsWith(root + "\\");

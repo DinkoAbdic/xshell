@@ -26,6 +26,10 @@ interface SettingsViewProps {
   onSetGitChangesTree: (enabled: boolean) => void;
   fileExplorerOnStart: boolean;
   onSetFileExplorerOnStart: (enabled: boolean) => void;
+  sidePanelSide: "left" | "right";
+  onSetSidePanelSide: (side: "left" | "right") => void;
+  emulatedInputSelection: boolean;
+  onSetEmulatedInputSelection: (enabled: boolean) => void;
   contextTreeEnabled: boolean;
   onSetContextTreeEnabled: (enabled: boolean) => void;
   terminalBgColor: string;
@@ -181,7 +185,7 @@ export const MIN_UI_ZOOM = 80;
 export const MAX_UI_ZOOM = 200;
 export const UI_ZOOM_STEP = 5;
 
-export function SettingsView({ theme, onSetTheme, uiZoom, onSetUiZoom, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, terminalScrollback, onSetTerminalScrollback, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo }: SettingsViewProps) {
+export function SettingsView({ theme, onSetTheme, uiZoom, onSetUiZoom, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, sidePanelSide, onSetSidePanelSide, emulatedInputSelection, onSetEmulatedInputSelection, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, terminalScrollback, onSetTerminalScrollback, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo }: SettingsViewProps) {
   const [active, setActive] = useState<Category>("appearance");
   const [wizardOpen, setWizardOpen] = useState(false);
   // Has the user run the wizard? Drives the disabled-state of the rate-limit + session-row
@@ -425,6 +429,9 @@ export function SettingsView({ theme, onSetTheme, uiZoom, onSetUiZoom, defaultAg
                     )}
                   </div>
                 </SettingRow>
+                <SettingRow title="Text selection in agent input (experimental)" description="Ctrl+A selects the whole prompt line, Shift+arrows select by character and Ctrl+Shift+arrows by word. Then Ctrl+C copies, Ctrl+X cuts, Backspace/Delete deletes and typing replaces the selection. Emulated by driving the agent's own cursor keys, so it can be off for multi-line input; turn it off if it misbehaves.">
+                  <Toggle checked={emulatedInputSelection} onChange={onSetEmulatedInputSelection} />
+                </SettingRow>
               </Section>
 
               <Section title="Shell" description="Which shell hosts your terminal and agent sessions.">
@@ -442,7 +449,10 @@ export function SettingsView({ theme, onSetTheme, uiZoom, onSetUiZoom, defaultAg
                 </SettingRow>
               </Section>
 
-              <Section title="Terminal sidebar" description="Right-side activity bar inside agent terminal tabs.">
+              <Section title="Terminal sidebar" description="Activity bar with the git and file-explorer panels inside agent terminal tabs.">
+                <SettingRow title="Panel position" description="Which side of the terminal the activity bar and the git / file-explorer panels sit on. Left puts them next to the projects sidebar, with the terminal (and any open code files) to their right.">
+                  <SelectMenu<"left" | "right"> value={sidePanelSide} onChange={onSetSidePanelSide} options={[{ value: "left", label: "Left" }, { value: "right", label: "Right" }]} />
+                </SettingRow>
                 <SettingRow title="Only poll git when panel is open" description="When on (default), git status is fetched once when the session starts, then again only while the git panel is open. Turn off to keep polling every few seconds even when the panel is closed.">
                   <Toggle checked={gitLazyPolling} onChange={onSetGitLazyPolling} />
                 </SettingRow>

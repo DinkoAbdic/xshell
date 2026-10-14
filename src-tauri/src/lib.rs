@@ -1022,6 +1022,149 @@ fn read_text_file(path: String) -> Result<String, String> {
     fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))
 }
 
+// ── Code editor ───────────────────────────────────────────────────────
+
+// Files above this size open as "too large" instead of loading into the editor.
+const CODE_FILE_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+#[derive(Serialize)]
+struct CodeFile {
+    content: Option<String>, // None when binary or too large
+    mtime_ms: u64,
+    size: u64,
+    binary: bool,
+    too_large: bool,
+}
+
+fn file_mtime_ms(meta: &fs::Metadata) -> u64 {
+    meta.modified().ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn read_code_file(path: String) -> Result<CodeFile, String> {
+    let meta = fs::metadata(&path).map_err(|e| format!("Failed to read file: {}", e))?;
+    let mtime_ms = file_mtime_ms(&meta);
+    let size = meta.len();
+    if size > CODE_FILE_MAX_BYTES {
+        return Ok(CodeFile { content: None, mtime_ms, size, binary: false, too_large: true });
+    }
+    let bytes = fs::read(&path).map_err(|e| format!("Failed to read file: {}", e))?;
+    // A NUL byte in the first 8 KB, or invalid UTF-8, means we can't show it as text.
+    let binary = bytes.iter().take(8192).any(|&b| b == 0);
+    let content = if binary { None } else { String::from_utf8(bytes).ok() };
+    let binary = binary || content.is_none();
+    Ok(CodeFile { content, mtime_ms, size, binary, too_large: false })
+}
+
+fn write_code_file(path: String, content: String) -> Result<u64, String> {
+    fs::write(&path, content.as_bytes()).map_err(|e| format!("Failed to save file: {}", e))?;
+    let meta = fs::metadata(&path).map_err(|e| format!("Failed to save file: {}", e))?;
+    Ok(file_mtime_ms(&meta))
+}
+
+// None when the file no longer exists.
+fn code_file_mtime(path: String) -> Option<u64> {
+    fs::metadata(&path).ok().map(|m| file_mtime_ms(&m))
+}
+
+// ── Project files: Quick Open + search ────────────────────────────────
+
+// Folders skipped even when a project has no .gitignore (or doesn't list them).
+const PROJECT_SKIP_DIRS: &[&str] = &["node_modules", ".git", "target", "dist", "build", ".next", ".nuxt", ".astro", ".svelte-kit", ".turbo", ".cache", ".venv", "venv", "__pycache__", ".idea", ".vs"];
+const PROJECT_MAX_FILES: usize = 50_000;
+
+fn project_walker(root: &str) -> ignore::Walk {
+    ignore::WalkBuilder::new(root)
+        .hidden(false)          // show dotfiles like .env / .github, but…
+        .git_ignore(true).git_global(true).git_exclude(true).ignore(true)
+        .require_git(false)     // …respect .gitignore even outside a git repo
+        .filter_entry(|e| !(e.file_type().map(|t| t.is_dir()).unwrap_or(false) && PROJECT_SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref())))
+        .build()
+}
+
+// Relative paths (forward slashes) of all files in a project, honoring .gitignore.
+fn list_project_files(root: String) -> Vec<String> {
+    let base = std::path::Path::new(&root);
+    let mut out = Vec::new();
+    for entry in project_walker(&root).flatten() {
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) { continue; }
+        if let Ok(rel) = entry.path().strip_prefix(base) {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+            if out.len() >= PROJECT_MAX_FILES { break; }
+        }
+    }
+    out
+}
+
+#[derive(Serialize)]
+struct SearchHit {
+    path: String,   // relative, forward slashes
+    line: usize,    // 1-based
+    col: usize,     // 1-based, in characters
+    text: String,   // the matching line (trimmed to a sane length)
+}
+
+// Plain-text search across a project's files (case-insensitive unless `case_sensitive`).
+// Skips binary and large files; stops at `limit` hits.
+fn search_project(root: String, query: String, case_sensitive: bool, limit: usize) -> Vec<SearchHit> {
+    if query.is_empty() { return vec![]; }
+    let base = std::path::Path::new(&root);
+    let needle = if case_sensitive { query.clone() } else { query.to_lowercase() };
+    let mut out = Vec::new();
+    for entry in project_walker(&root).flatten() {
+        if out.len() >= limit { break; }
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) { continue; }
+        if entry.metadata().map(|m| m.len() > 2 * 1024 * 1024).unwrap_or(true) { continue; }
+        let Ok(bytes) = fs::read(entry.path()) else { continue };
+        if bytes.iter().take(8192).any(|&b| b == 0) { continue; }
+        let Ok(text) = String::from_utf8(bytes) else { continue };
+        let rel = match entry.path().strip_prefix(base) { Ok(r) => r.to_string_lossy().replace('\\', "/"), Err(_) => continue };
+        for (i, line) in text.lines().enumerate() {
+            let hay = if case_sensitive { std::borrow::Cow::Borrowed(line) } else { std::borrow::Cow::Owned(line.to_lowercase()) };
+            if let Some(byte_idx) = hay.find(&needle) {
+                let col = hay[..byte_idx].chars().count() + 1;
+                let shown: String = line.chars().take(400).collect();
+                out.push(SearchHit { path: rel.clone(), line: i + 1, col, text: shown });
+                if out.len() >= limit { break; }
+            }
+        }
+    }
+    out
+}
+
+// ── Terminal path links ───────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct ResolvedPath {
+    path: String,
+    is_dir: bool,
+}
+
+// Resolves path-like strings found in terminal output against the tab's cwd. Returns, per
+// candidate, the absolute path when it exists on disk (None otherwise), so the terminal only
+// turns real files/folders into Ctrl+click links.
+fn resolve_paths(cwd: String, paths: Vec<String>) -> Vec<Option<ResolvedPath>> {
+    paths.into_iter().map(|raw| {
+        let p = std::path::Path::new(raw.trim());
+        let joined = if p.is_absolute() { p.to_path_buf() } else { std::path::Path::new(&cwd).join(p) };
+        // Lexical normalization: drop "." and fold ".." so the result matches explorer paths.
+        let mut norm = PathBuf::new();
+        for c in joined.components() {
+            match c {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => { norm.pop(); }
+                other => norm.push(other.as_os_str()),
+            }
+        }
+        let meta = fs::metadata(&norm).ok()?;
+        let mut path = norm.to_string_lossy().into_owned();
+        if cfg!(windows) { path = path.replace('/', "\\"); }
+        Some(ResolvedPath { path, is_dir: meta.is_dir() })
+    }).collect()
+}
+
 fn read_image_base64(path: String) -> Result<String, String> {
     let data = fs::read(&path).map_err(|e| format!("Failed to read image: {}", e))?;
     let ext = std::path::Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("png").to_lowercase();
@@ -1881,6 +2024,17 @@ pub struct GitCommit {
     pub subject: String,
     pub author: String,
     pub relative_time: String,
+}
+
+// File content at HEAD, for the editor's change markers. None when the file isn't in a repo,
+// is untracked, or the repo has no commits yet.
+fn git_head_content(path: String) -> Option<String> {
+    let p = std::path::Path::new(&path);
+    let dir = p.parent()?.to_string_lossy().into_owned();
+    let name = p.file_name()?.to_string_lossy().into_owned();
+    let out = git_cmd(&dir).arg("show").arg(format!("HEAD:./{}", name)).output().ok()?;
+    if !out.status.success() { return None; }
+    String::from_utf8(out.stdout).ok()
 }
 
 fn git_cmd(cwd: &str) -> std::process::Command {
@@ -3997,6 +4151,41 @@ mod bg {
     }
 
     #[tauri::command]
+    pub async fn resolve_paths(cwd: String, paths: Vec<String>) -> Result<Vec<Option<ResolvedPath>>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::resolve_paths(cwd, paths)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn git_head_content(path: String) -> Result<Option<String>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::git_head_content(path)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn list_project_files(root: String) -> Result<Vec<String>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::list_project_files(root)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn search_project(root: String, query: String, case_sensitive: bool, limit: usize) -> Result<Vec<SearchHit>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::search_project(root, query, case_sensitive, limit.min(5000))).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn read_code_file(path: String) -> Result<CodeFile, String> {
+        tauri::async_runtime::spawn_blocking(move || super::read_code_file(path)).await.map_err(|e| e.to_string())?
+    }
+
+    #[tauri::command]
+    pub async fn write_code_file(path: String, content: String) -> Result<u64, String> {
+        tauri::async_runtime::spawn_blocking(move || super::write_code_file(path, content)).await.map_err(|e| e.to_string())?
+    }
+
+    #[tauri::command]
+    pub async fn code_file_mtime(path: String) -> Result<Option<u64>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::code_file_mtime(path)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
     pub async fn get_project_skills(project_path: String) -> Result<ProjectSkills, String> {
         tauri::async_runtime::spawn_blocking(move || super::get_project_skills(project_path)).await.map_err(|e| e.to_string())
     }
@@ -4106,7 +4295,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(AppState { terminals: Mutex::new(HashMap::new()) })
         .setup(|app| { start_agent_data_watcher(app.handle().clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![bg::list_claude_projects, bg::get_sessions, bg::get_sessions_for_projects, bg::list_dev_servers, bg::find_git_repos, bg::git_fetch_remote, bg::git_pull, bg::stop_dev_server, bg::get_all_recent_sessions, bg::get_session_messages, bg::read_image_base64, bg::save_dropped_file, bg::read_text_file, reveal_in_explorer, list_dir, search_dir, open_url, get_username, get_home_dir, bg::get_project_skills, bg::get_project_memories, get_git_status, get_git_log, git_diff, bg::git_stage, bg::git_unstage, git_discard, bg::list_git_branches, bg::git_checkout, bg::list_project_session_ids, bg::detect_session_branch, bg::probe_statusline_setup, bg::get_global_rate_limits, detect_agent_binary, bg::list_codex_projects, bg::list_cursor_projects, bg::list_opencode_projects, bg::list_antigravity_projects, bg::get_codex_context, bg::get_cursor_context, bg::get_opencode_context, bg::get_antigravity_context, bg::get_claude_cost_summary, bg::get_codex_usage, spawn_terminal, write_terminal, resize_terminal, close_terminal])
+        .invoke_handler(tauri::generate_handler![bg::list_claude_projects, bg::get_sessions, bg::get_sessions_for_projects, bg::list_dev_servers, bg::find_git_repos, bg::git_fetch_remote, bg::git_pull, bg::stop_dev_server, bg::get_all_recent_sessions, bg::get_session_messages, bg::read_image_base64, bg::save_dropped_file, bg::read_text_file, bg::read_code_file, bg::write_code_file, bg::list_project_files, bg::search_project, bg::git_head_content, bg::resolve_paths, bg::code_file_mtime, reveal_in_explorer, list_dir, search_dir, open_url, get_username, get_home_dir, bg::get_project_skills, bg::get_project_memories, get_git_status, get_git_log, git_diff, bg::git_stage, bg::git_unstage, git_discard, bg::list_git_branches, bg::git_checkout, bg::list_project_session_ids, bg::detect_session_branch, bg::probe_statusline_setup, bg::get_global_rate_limits, detect_agent_binary, bg::list_codex_projects, bg::list_cursor_projects, bg::list_opencode_projects, bg::list_antigravity_projects, bg::get_codex_context, bg::get_cursor_context, bg::get_opencode_context, bg::get_antigravity_context, bg::get_claude_cost_summary, bg::get_codex_usage, spawn_terminal, write_terminal, resize_terminal, close_terminal])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

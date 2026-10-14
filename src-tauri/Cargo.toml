@@ -28,6 +28,8 @@ md5 = "0.7"
 notify = "8"
 listeners = "0.6"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# .gitignore-aware directory walking for Quick Open (Ctrl+P) and project search (Ctrl+Shift+F).
+ignore = "0.4"
 
 # Dev profile: fast incremental rebuilds, light optimization for deps
 [profile.dev]

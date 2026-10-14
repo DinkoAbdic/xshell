@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback, useLayoutEffect, useMemo } from "react";
+import { useEffect, useRef, useState, useCallback, useLayoutEffect, useMemo, lazy, Suspense } from "react";
 import hljs from "highlight.js/lib/common";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
@@ -7,8 +7,15 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
-import { GitBranch, ArrowUp, ArrowDown, RefreshCw, ChevronRight, ChevronDown, Plus, Minus, History, GitFork, Pencil, X as XIcon, Check, Search, AlertTriangle, Cloud, FolderTree, FileDiff, RotateCcw, Square, FolderGit2 } from "lucide-react";
+import { GitBranch, ArrowUp, ArrowDown, RefreshCw, ChevronRight, ChevronDown, Plus, Minus, History, GitFork, Pencil, X as XIcon, Check, Search, AlertTriangle, Cloud, FolderTree, FileDiff, RotateCcw, Square, FolderGit2, FileCode, SquareTerminal, ChevronUp } from "lucide-react";
 import { FileExplorerPanel, DRAG_PATH_MIME } from "./FileExplorerPanel";
+import { confirmDialog } from "./ConfirmDialog";
+import { ShellTerminal } from "./ShellTerminal";
+import { QuickOpenDialog, ProjectSearchDialog } from "./FileFinder";
+import { registerPathLinks, openPathTarget, type PathTarget } from "../lib/pathLinks";
+import { attachInputSelection } from "../lib/inputSelection";
+// CodeMirror and its language packs load only when the first file is opened.
+const CodeEditorPane = lazy(() => import("./editor/CodeEditorPane"));
 import { fileIconUrl, plainFolderIconUrl } from "../lib/fileIcons";
 import "@xterm/xterm/css/xterm.css";
 import { detectMonoFontFamily, ensureMonoFontsLoaded } from "../lib/fonts";
@@ -103,7 +110,7 @@ const LIGHT_PALETTE = {
   brightWhite: "#141413",
 } as const;
 
-function paletteFor(theme: ThemeMode, bgOverride: string) {
+export function paletteFor(theme: ThemeMode, bgOverride: string) {
   const base = theme === "light" ? LIGHT_PALETTE : DARK_PALETTE;
   // The user's saved bg only overrides if it's a real custom pick — i.e. not one of the
   // two known theme defaults. That way, users who never touched the picker get the right
@@ -151,6 +158,8 @@ interface TerminalTabProps {
   gitLazyPolling: boolean;
   gitChangesTree: boolean;
   fileExplorerOnStart: boolean;
+  sidePanelSide: "left" | "right";
+  emulatedInputSelection: boolean;
   terminalBgColor: string;
   defaultFontSize: number;
   defaultShellId: string;
@@ -218,13 +227,23 @@ const DEFAULT_PANEL = 280;
 // Leave room for the activity bar (32) + splitter (4) + a thin terminal sliver (~40) when the
 // panel is dragged to its widest, so it can cover almost the whole terminal but stay grabbable.
 const PANEL_EDGE_RESERVE = 76;
+// Code editor pane (between the terminal and the side panel): min width of the editor and of
+// the terminal left beside it.
+const MIN_EDITOR = 260;
+// Bottom terminal panel height bounds.
+const DEFAULT_BOTTOM_PANEL = 240;
+const MIN_BOTTOM_PANEL = 90;
+const MIN_TERMINAL_ABOVE_PANEL = 120;
+const MIN_TERMINAL_BESIDE_EDITOR = 220;
 
-export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisible, gitLazyPolling, gitChangesTree, fileExplorerOnStart, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, scrollback, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch }: TerminalTabProps) {
+export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisible, gitLazyPolling, gitChangesTree, fileExplorerOnStart, sidePanelSide, emulatedInputSelection, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, scrollback, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch }: TerminalTabProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const webglAddonRef = useRef<WebglAddon | null>(null);
   const isVisibleRef = useRef(isVisible);
+  const emulatedInputSelectionRef = useRef(emulatedInputSelection);
+  emulatedInputSelectionRef.current = emulatedInputSelection;
   const windowVisible = useWindowVisible();
   isVisibleRef.current = isVisible;
   const [_error, setError] = useState<string | null>(null);
@@ -248,6 +267,37 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
   // user opens it the first time (or it opens on start), so tabs that never use it pay nothing.
   const [fileExplorerMounted, setFileExplorerMounted] = useState(openExplorerByDefault);
   const [gitPanelWidth, setGitPanelWidth] = useState(DEFAULT_PANEL);
+  // Files opened from the explorer, shown in a code editor split beside the terminal. Restored
+  // per tab after a restart (tab ids are persisted with the tabs).
+  const editorPrefKey = `xshell.editor:${tab.id}`;
+  const savedEditor = useMemo(() => {
+    try {
+      const v = JSON.parse(localStorage.getItem(editorPrefKey) || "null");
+      if (v && Array.isArray(v.files)) return v as { files: string[]; active: string | null; width: number };
+    } catch (_) {}
+    return null;
+  }, [editorPrefKey]);
+  const [editorFiles, setEditorFiles] = useState<string[]>(savedEditor?.files ?? []);
+  const [editorActive, setEditorActive] = useState<string | null>(savedEditor?.active ?? null);
+  const [editorWidth, setEditorWidth] = useState(savedEditor?.width ?? 0);
+  useEffect(() => {
+    try {
+      if (editorFiles.length === 0) localStorage.removeItem(editorPrefKey);
+      else localStorage.setItem(editorPrefKey, JSON.stringify({ files: editorFiles, active: editorActive, width: editorWidth }));
+    } catch (_) {}
+  }, [editorPrefKey, editorFiles, editorActive, editorWidth]);
+  // Line to jump to in the editor (Ctrl+click on `path:line` in terminal output). `seq` makes
+  // repeated clicks on the same target jump again.
+  const [editorGoto, setEditorGoto] = useState<{ path: string; line: number; col?: number; seq: number } | null>(null);
+  // Bottom panel: plain shells in the project folder (dev servers, builds…). Each shell's PTY id
+  // is `<tab id>::shell-<n>`, so dev servers started there are still attributed to this tab.
+  const [bottomShells, setBottomShells] = useState<{ id: string; title: string; cwd?: string }[]>([]);
+  const [bottomActive, setBottomActive] = useState<string | null>(null);
+  const [bottomOpen, setBottomOpen] = useState(false);
+  const [bottomHeight, setBottomHeight] = useState(DEFAULT_BOTTOM_PANEL);
+  const shellCounterRef = useRef(0);
+  // Quick Open (Ctrl+P) / Search in project (Ctrl+Shift+F) dialog.
+  const [finder, setFinder] = useState<"files" | "search" | null>(null);
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [gitCommits, setGitCommits] = useState<GitCommit[]>([]);
   const [gitRefreshing, setGitRefreshing] = useState(false);
@@ -417,6 +467,8 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
     // column math uses the right widths.
     term.loadAddon(new Unicode11Addon());
     term.unicode.activeVersion = "11";
+    // Ctrl+click on file paths in the output (code files open in the editor, others reveal).
+    const pathLinks = registerPathLinks(term, () => tabRef.current.projectPath, (t) => openPathRef.current(t));
 
     // Set by the cleanup below. The spawn waits on fonts and layout, so it can still be pending
     // when this effect is torn down: React StrictMode (dev) mounts every component twice and tears
@@ -485,7 +537,11 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
 
     // Intercept Ctrl+= / Ctrl++ / Ctrl+- / Ctrl+0 for zoom, and Ctrl+V for paste
     // (Windows Terminal convention — the terminal would otherwise swallow Ctrl+V as ^V).
+    // Experimental emulated selection in the agent's prompt input (Settings toggle; see
+    // lib/inputSelection.ts). Agent tabs only — raw shells keep plain terminal keys.
+    const inputSelection = attachInputSelection(term, (data) => { invoke("write_terminal", { id: tabRef.current.id, data }).catch(() => {}); });
     term.attachCustomKeyEventHandler((ev) => {
+      if (emulatedInputSelectionRef.current && (tabRef.current.shellMode || "claude") === "claude" && !inputSelection.handleKey(ev)) return false;
       if (!ev.ctrlKey || ev.type !== "keydown") return true;
       if (ev.key === "+" || ev.key === "=") { applyFontSize(fontSizeRef.current + 1); ev.preventDefault(); return false; }
       if (ev.key === "-" || ev.key === "_") { applyFontSize(fontSizeRef.current - 1); ev.preventDefault(); return false; }
@@ -673,6 +729,8 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
       // explicit dispose() is required to free the GL resources cleanly. term.dispose()
       // does cascade, but ordering it this way mirrors the xterm.js example.
       if (webglAddonRef.current) { webglAddonRef.current.dispose(); webglAddonRef.current = null; }
+      pathLinks.dispose();
+      inputSelection.dispose();
       term.dispose();
     };
   }, []);
@@ -725,7 +783,7 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
   useEffect(() => {
     if (!fitAddonRef.current) return;
     requestAnimationFrame(() => fitAddonRef.current?.fit());
-  }, [showGitPanel, showFilePanel, gitPanelWidth]);
+  }, [showGitPanel, showFilePanel, gitPanelWidth, editorFiles.length > 0, editorWidth, bottomOpen, bottomHeight]);
 
   // Live-update the full xterm palette whenever the app theme or the user's bg-override
   // changes. Using `paletteFor` keeps the brand-relative colors (cursor, ANSI) consistent
@@ -843,7 +901,7 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
     if (!tab.projectPath || checkoutInFlight) return;
     const dirty = (gitStatus?.files.length || 0) > 0;
     if (dirty) {
-      const ok = window.confirm(`You have uncommitted changes. Switch to "${branch}" anyway?\n\nGit will refuse the switch if any of those changes would be overwritten by the target branch.`);
+      const ok = await confirmDialog({ title: "Uncommitted changes", message: `You have uncommitted changes. Switch to "${branch}" anyway?`, detail: "Git will refuse the switch if any of those changes would be overwritten by the target branch.", confirmLabel: "Switch branch" });
       if (!ok) return;
     }
     setCheckoutInFlight(true);
@@ -1035,7 +1093,8 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
     const bodyWidth = e.currentTarget.parentElement?.clientWidth ?? window.innerWidth;
     const maxPanel = Math.max(MIN_PANEL, bodyWidth - PANEL_EDGE_RESERVE);
     const onMove = (ev: PointerEvent) => {
-      const delta = startX - ev.clientX;
+      // The panel grows away from the terminal: leftwards when it sits on the right, rightwards on the left.
+      const delta = sidePanelSide === "left" ? ev.clientX - startX : startX - ev.clientX;
       setGitPanelWidth(Math.max(MIN_PANEL, Math.min(maxPanel, startWidth + delta)));
     };
     const onUp = () => {
@@ -1048,7 +1107,145 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
     window.addEventListener("pointerup", onUp);
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
-  }, [gitPanelWidth]);
+  }, [gitPanelWidth, sidePanelSide]);
+
+  const editorFilesRef = useRef(editorFiles);
+  editorFilesRef.current = editorFiles;
+  const openFileInEditor = useCallback((path: string, line?: number, col?: number) => {
+    if (line) setEditorGoto((g) => ({ path, line, col, seq: (g?.seq ?? 0) + 1 }));
+    const fs = editorFilesRef.current;
+    if (!fs.includes(path)) {
+      // First file: split the terminal's current width in half.
+      if (fs.length === 0) setEditorWidth(Math.max(MIN_EDITOR, Math.round((containerRef.current?.clientWidth ?? 800) / 2)));
+      setEditorFiles([...fs, path]);
+    }
+    setEditorActive(path);
+  }, []);
+
+  const closeEditorFile = useCallback((path: string) => {
+    const fs = editorFilesRef.current;
+    const i = fs.indexOf(path);
+    if (i < 0) return;
+    const next = fs.filter((p) => p !== path);
+    setEditorFiles(next);
+    setEditorActive((a) => (a === path ? next[Math.min(i, next.length - 1)] ?? null : a));
+  }, []);
+
+  // Paste a file reference into the agent's prompt: Claude Code's `@path#L10-20` mention form,
+  // plain `path:10-20` for other agents. Pasted (not typed) so it doesn't trigger autocomplete.
+  const sendFileRefToAgent = useCallback((path: string, from: number | null, to: number | null) => {
+    const term = terminalRef.current;
+    if (!term) return;
+    const root = (tabRef.current.projectPath || "").replace(/[\\/]+$/, "");
+    let rel = root && path.toLowerCase().startsWith(root.toLowerCase()) ? path.slice(root.length).replace(/^[\\/]+/, "") : path;
+    rel = rel.replace(/\\/g, "/");
+    if (/\s/.test(rel)) rel = `"${rel}"`;
+    const isClaude = (tabRef.current.agent || "claude") === "claude";
+    const lines = from === null ? "" : from === to ? `${from}` : `${from}-${to}`;
+    const ref = isClaude ? `@${rel}${lines ? `#L${lines}` : ""}` : `${rel}${lines ? `:${lines}` : ""}`;
+    term.paste(ref + " ");
+    term.focus();
+  }, []);
+
+  const openPath = useCallback((t: PathTarget) => openPathTarget(t, openFileInEditor), [openFileInEditor]);
+  const openPathRef = useRef(openPath);
+  openPathRef.current = openPath;
+
+  const palette = useMemo(() => paletteFor(theme, terminalBgColor), [theme, terminalBgColor]);
+  const bottomShellId = defaultShellId || null;
+  // `cwd` opens the shell in a subfolder (explorer's "Open terminal here"); default is the project.
+  const addBottomShell = useCallback((cwd?: string) => {
+    const n = ++shellCounterRef.current;
+    const name = (bottomShellId && getShellById(bottomShellId)?.name) || "Shell";
+    const id = `${tab.id}::shell-${n}`;
+    const folder = cwd ? cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() : "";
+    setBottomShells((ss) => [...ss, { id, title: folder ? `${folder} (${name})` : `${name} ${n}`, cwd }]);
+    setBottomActive(id);
+    setBottomOpen(true);
+  }, [tab.id, bottomShellId]);
+  const bottomShellsRef = useRef(bottomShells);
+  bottomShellsRef.current = bottomShells;
+  const closeBottomShell = useCallback((id: string) => {
+    const ss = bottomShellsRef.current;
+    const i = ss.findIndex((s) => s.id === id);
+    if (i < 0) return;
+    const next = ss.filter((s) => s.id !== id);
+    setBottomShells(next);
+    setBottomActive((a) => (a === id ? next[Math.min(i, next.length - 1)]?.id ?? null : a));
+    if (next.length === 0) { setBottomOpen(false); terminalRef.current?.focus(); }
+  }, []);
+  const toggleBottomPanel = useCallback(() => {
+    if (!tab.projectPath) return;
+    if (bottomShellsRef.current.length === 0) { addBottomShell(); return; }
+    setBottomOpen((o) => {
+      if (o) requestAnimationFrame(() => terminalRef.current?.focus());
+      return !o;
+    });
+  }, [tab.projectPath, addBottomShell]);
+
+  // IDE shortcuts for the focused tab: Ctrl+` toggles the bottom panel, Ctrl+P opens Quick
+  // Open, Ctrl+Shift+F searches the project. Capture phase, so they win over xterm and the
+  // code editor, which would otherwise swallow the keys.
+  useEffect(() => {
+    if (!isActive) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || e.altKey || e.metaKey) return;
+      let handled = true;
+      if (!e.shiftKey && e.code === "Backquote") toggleBottomPanel();
+      else if (!e.shiftKey && e.code === "KeyP" && tabRef.current.projectPath) setFinder((f) => (f === "files" ? null : "files"));
+      else if (e.shiftKey && e.code === "KeyF" && tabRef.current.projectPath) setFinder((f) => (f === "search" ? null : "search"));
+      else handled = false;
+      if (!handled) return;
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [isActive, toggleBottomPanel]);
+
+  // Splitter above the bottom panel — drag up to make the panel taller.
+  const onBottomSplitterDown = useCallback((e: React.PointerEvent) => {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startHeight = bottomHeight;
+    const mainHeight = e.currentTarget.parentElement?.clientHeight ?? window.innerHeight;
+    const maxHeight = Math.max(MIN_BOTTOM_PANEL, mainHeight - MIN_TERMINAL_ABOVE_PANEL);
+    const onMove = (ev: PointerEvent) => setBottomHeight(Math.max(MIN_BOTTOM_PANEL, Math.min(maxHeight, startHeight + startY - ev.clientY)));
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+  }, [bottomHeight]);
+
+  // Splitter between the terminal and the editor — drag toward the terminal to widen the editor
+  // (left when the editor sits right of the terminal, right when panels are on the left).
+  const onEditorSplitterDown = useCallback((e: React.PointerEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = editorWidth;
+    const termWidth = containerRef.current?.clientWidth ?? 0;
+    const maxEditor = Math.max(MIN_EDITOR, startWidth + termWidth - MIN_TERMINAL_BESIDE_EDITOR);
+    const onMove = (ev: PointerEvent) => {
+      const delta = sidePanelSide === "left" ? ev.clientX - startX : startX - ev.clientX;
+      setEditorWidth(Math.max(MIN_EDITOR, Math.min(maxEditor, startWidth + delta)));
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }, [editorWidth, sidePanelSide]);
 
   // Vertical splitter between the changes list and the Diff/History panel — drag up = taller.
   const onGitBottomSplitterDown = useCallback((e: React.PointerEvent) => {
@@ -1174,7 +1371,9 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
           <button className="branch-banner-btn" onClick={dismissRenameNotice} aria-label="Dismiss"><XIcon size={12} /></button>
         </div>
       )}
-      <div className="terminal-body">
+      <div className={`terminal-body ${sidePanelSide === "left" ? "panels-left" : ""}`}>
+        <div className="terminal-main">
+        <div className="terminal-main-row">
         <div
           className="terminal-container"
           ref={containerRef}
@@ -1214,9 +1413,50 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
             </div>
           )}
         </div>
+        {editorFiles.length > 0 && tab.projectPath && (
+          <>
+            <div className="terminal-splitter editor-splitter" onPointerDown={onEditorSplitterDown} onMouseEnter={(e) => showTt("Drag to resize", e.currentTarget)} onMouseLeave={hideTt} />
+            <div className="code-editor-slot" style={{ width: editorWidth }}>
+              <Suspense fallback={<div className="code-editor-message">Loading editor…</div>}>
+                <CodeEditorPane files={editorFiles} active={editorActive} rootPath={tab.projectPath} visible={isVisible} gotoTarget={editorGoto} onSendToAgent={isClaudeSession ? sendFileRefToAgent : undefined} onActivate={setEditorActive} onClose={closeEditorFile} />
+              </Suspense>
+            </div>
+          </>
+        )}
+        </div>
+        {bottomShells.length > 0 && tab.projectPath && (
+          // Kept mounted while hidden so shells (dev servers…) keep running.
+          <>
+            <div className="terminal-hsplitter" style={{ display: bottomOpen ? undefined : "none" }} onPointerDown={onBottomSplitterDown} />
+            <div className={`bottom-panel ${bottomOpen ? "" : "collapsed"}`} style={{ height: bottomOpen ? bottomHeight : undefined }}>
+              <div className="bottom-panel-tabs">
+                {bottomShells.map((s) => (
+                  <div key={s.id} className={`bottom-panel-tab ${s.id === bottomActive ? "active" : ""}`} onClick={() => { setBottomActive(s.id); setBottomOpen(true); }} onAuxClick={(e) => { if (e.button === 1) closeBottomShell(s.id); }}>
+                    <SquareTerminal size={12} />
+                    <span>{s.title}</span>
+                    <button className="bottom-panel-tab-close" onClick={(e) => { e.stopPropagation(); closeBottomShell(s.id); }} aria-label="Close shell"><XIcon size={11} /></button>
+                  </div>
+                ))}
+                <button className="bottom-panel-btn" onClick={() => addBottomShell()} onMouseEnter={(e) => showTt("New shell", e.currentTarget)} onMouseLeave={hideTt}><Plus size={13} /></button>
+                <div className="bottom-panel-spacer" />
+                <button className="bottom-panel-btn" onClick={() => { setBottomOpen((o) => !o); hideTt(); }} onMouseEnter={(e) => showTt(`${bottomOpen ? "Hide" : "Show"} panel (Ctrl+\`)`, e.currentTarget)} onMouseLeave={hideTt}>{bottomOpen ? <ChevronDown size={14} /> : <ChevronUp size={14} />}</button>
+              </div>
+              <div className="bottom-panel-body" style={{ display: bottomOpen ? undefined : "none" }}>
+                {bottomShells.map((s) => (
+                  <div key={s.id} className="bottom-panel-shell" style={{ display: s.id === bottomActive ? undefined : "none" }}>
+                    <ShellTerminal id={s.id} cwd={s.cwd ?? tab.projectPath!} shellId={bottomShellId} shellCommand={bottomShellId ? getShellById(bottomShellId)?.command ?? null : null}
+                      palette={palette} fontSize={defaultFontSize} fontWeight={terminalFontWeight} scrollback={scrollback}
+                      visible={isVisible && bottomOpen && s.id === bottomActive} onExit={() => closeBottomShell(s.id)} onOpenPath={openPath} />
+                  </div>
+                ))}
+              </div>
+            </div>
+          </>
+        )}
+        </div>
         {isClaudeSession && showGitPanel && gitStatus?.is_repo && (
           <>
-            <div className="terminal-splitter" onPointerDown={onSplitterDown} onMouseEnter={(e) => showTt("Drag to resize", e.currentTarget)} onMouseLeave={hideTt} />
+            <div className="terminal-splitter side-splitter" onPointerDown={onSplitterDown} onMouseEnter={(e) => showTt("Drag to resize", e.currentTarget)} onMouseLeave={hideTt} />
             <div className="terminal-side-panel" style={{ width: gitPanelWidth }}>
               {gitRepos.length > 1 && gitCwd && (
                 <div className="git-repo-picker">
@@ -1286,9 +1526,9 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
           // Kept mounted once opened (toggled with `display`, not unmounted) so the explorer's
           // path + expansion state persist across panel toggles and tab switches.
           <>
-            <div className="terminal-splitter" style={{ display: showFilePanel ? undefined : "none" }} onPointerDown={onSplitterDown} onMouseEnter={(e) => showTt("Drag to resize", e.currentTarget)} onMouseLeave={hideTt} />
+            <div className="terminal-splitter side-splitter" style={{ display: showFilePanel ? undefined : "none" }} onPointerDown={onSplitterDown} onMouseEnter={(e) => showTt("Drag to resize", e.currentTarget)} onMouseLeave={hideTt} />
             <div className="terminal-side-panel" style={{ width: gitPanelWidth, display: showFilePanel ? undefined : "none" }}>
-              <FileExplorerPanel rootPath={tab.projectPath} terminalId={tab.id} visible={showFilePanel} showTt={showTt} hideTt={hideTt} />
+              <FileExplorerPanel rootPath={tab.projectPath} terminalId={tab.id} visible={showFilePanel} onOpenFile={openFileInEditor} onOpenTerminal={addBottomShell} showTt={showTt} hideTt={hideTt} />
             </div>
           </>
         )}
@@ -1325,10 +1565,22 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
             >
               <FolderTree size={15} />
             </button>
+            <button
+              className={`terminal-activity-btn ${bottomOpen ? "active" : ""}`}
+              disabled={!tab.projectPath}
+              onClick={() => { toggleBottomPanel(); hideTt(); }}
+              onMouseEnter={(e) => showTt(`${bottomOpen ? "Hide" : "Show"} terminal panel (Ctrl+\`)`, e.currentTarget)}
+              onMouseLeave={hideTt}
+              aria-label="Toggle terminal panel"
+            >
+              <SquareTerminal size={15} />
+            </button>
           </div>
         )}
       </div>
       {tooltip && <TerminalTooltip text={tooltip.text} rect={tooltip.rect} />}
+      {finder === "files" && tab.projectPath && <QuickOpenDialog root={tab.projectPath} onOpen={openFileInEditor} onClose={() => setFinder(null)} />}
+      {finder === "search" && tab.projectPath && <ProjectSearchDialog root={tab.projectPath} onOpen={openFileInEditor} onClose={() => setFinder(null)} />}
       {gitCtx && (
         <>
           <div className="file-ctx-backdrop" onClick={() => setGitCtx(null)} onContextMenu={(e) => { e.preventDefault(); setGitCtx(null); }} />
@@ -1342,6 +1594,7 @@ export function TerminalTab({ tab, devServers, onStopDevServer, isActive, isVisi
             ) : (
               <>
                 <button className="file-ctx-item" onClick={() => { selectDiff(gitCtx.postRename, gitCtx.column); setGitCtx(null); }}><FileDiff size={13} /><span>Show diff</span></button>
+                {gitCwd && <button className="file-ctx-item" onClick={() => { { const sep = gitCwd.includes("\\") ? "\\" : "/"; openFileInEditor(gitCwd.replace(/[\\/]+$/, "") + sep + gitCtx.postRename.replace(/[\\/]/g, sep)); } setGitCtx(null); }}><FileCode size={13} /><span>Open file</span></button>}
                 {gitCtx.column === "staged"
                   ? <button className="file-ctx-item" onClick={() => { handleUnstageFile(gitCtx.postRename); setGitCtx(null); }}><Minus size={13} /><span>Unstage</span></button>
                   : <button className="file-ctx-item" onClick={() => { handleStageFile(gitCtx.postRename); setGitCtx(null); }}><Plus size={13} /><span>Stage</span></button>}
